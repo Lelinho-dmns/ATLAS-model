@@ -1,0 +1,7 @@
+[project]
+name = "atlas-model"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "wandb>=0.31.0",
+]

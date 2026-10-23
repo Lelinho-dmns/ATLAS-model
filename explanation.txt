@@ -1,0 +1,348 @@
+ATLAS ON MY VIDEO AND ON CHOLECSEG8K - WHAT WAS DONE, STEP BY STEP
+=====================================================================
+
+This file explains, in order, everything that was done to run the ATLAS
+segmentation model on my laparoscopic video and to evaluate it on CholecSeg8k:
+the ideas, the problems met along the way, how they were solved, and what each
+piece of code does.
+
+Files created (all in /homes/eprato01/ATLAS-model/inference/):
+    preprocess_video.py       video -> frames
+    infer_video.py            frames -> masks, overlay video, statistics
+    report.py                 statistics + representative frames + W&B (my video)
+    run_inference.sh          SLURM job: preprocess + inference + report
+    eval_cholecseg8k.py       quantitative evaluation on CholecSeg8k + W&B
+    run_eval_cholecseg8k.sh   SLURM job for the evaluation
+
+Results:
+    /work/tesi_eprato01/ATLAS_inference/aries_crop_2025-08-25_073541_VID001/
+    /work/tesi_eprato01/ATLAS_inference/cholecseg8k/eval_vits_clip1/
+    W&B project ATLAS-inference     (my video)
+    W&B project ATLAS-CholecSeg8k   (benchmark)
+
+
+---------------------------------------------------------------------
+STEP 1 - Understanding the repository
+---------------------------------------------------------------------
+
+The repo only contains TRAINING code (main.py fit/validate with Lightning).
+There is no inference script, so the first job was to understand exactly how
+the model sees an image, in order to reproduce it outside of Lightning.
+
+Files read and what was learned from each:
+
+  configs/ATLAS_DINOv3_vits.yaml
+    - input size 256x256, 30 classes, 100 mask queries, 4 "masked" blocks
+    - backbone: facebook/dinov3-vits16-pretrain-lvd1689m (HuggingFace)
+    - pixel_mean / pixel_std: custom values computed on surgical images
+    - clip_length 5 in training (the model learns on short clips)
+
+  models/atlas.py  (the network)
+    - It is an EoMT ("Encoder-only Mask Transformer"): there is NO separate
+      decoder. Learnable queries are concatenated to the patch tokens and
+      pass through the LAST 4 blocks of the ViT together with the image.
+    - Extra tokens added by ATLAS:
+        * 1 procedure query  -> procedure head (14 procedures)
+        * 4 phase/temporal tokens, with a small MLP encoding the position
+          of the frame inside the clip (time_index)
+        * query_updater: the queries of frame t-1 are transformed and
+          added to the queries of frame t ("temporal query propagation")
+    - Output, per block: mask_logits (one mask per query) and class_logits
+      (one class distribution per query, 30 classes + "no object").
+
+  training/lightning_module.py
+    - forward(): divides the image by 255 -> the network expects uint8
+      images converted to [0,1]; normalisation is done inside the network.
+    - window_imgs_semantic(): how a non-square frame is handled at test time:
+        1. resize (PIL bilinear) so that the SHORT side becomes 256
+        2. cut overlapping 256x256 windows along the LONG side
+    - revert_window_logits_semantic(): average the overlapping windows and
+      resize the scores back to the original resolution.
+    - to_per_pixel_logits_semantic(): how masks + classes become a semantic
+      map:  score[c, pixel] = sum over queries of
+                 sigmoid(mask_logit[q, pixel]) * softmax(class_logit[q])[c]
+      Then argmax over c gives the class of each pixel.
+
+  training/mask_classification_semantic.py
+    - eval_step(): IMPORTANT DETAIL. In the dataset, clips are built only
+      for the "train" split. Validation frames are given one at a time, so
+      the published validation numbers come from PER-FRAME inference
+      (time_index 0, no query propagation). That is why per-frame is the
+      default mode in my scripts (--clip_length 1). The temporal mode
+      (--clip_length 5) was also implemented, to mimic training.
+
+  datasets/atlas_semantic.py
+    - The 30 class names and the 14 procedure names (copied into
+      infer_video.py, to avoid importing the whole data module).
+
+Idea: write a standalone inference script that rebuilds the network and
+re-implements exactly the same resize / windowing / score computation.
+
+
+---------------------------------------------------------------------
+STEP 2 - Checking the environment
+---------------------------------------------------------------------
+
+Checked:
+  - the video: 1920x1080, 30 fps, 186.9 s, 5608 frames, h264. A sample frame
+    showed a circular endoscope view with black borders.
+  - Python environments: myenv already had torch 2.7.0 and
+    transformers 4.56.1 (the same versions as requirements.txt). The repo
+    .venv had no torch at the beginning.
+  - ffmpeg: available as a module (module load ffmpeg/8.1). No OpenCV.
+  - the checkpoint: /work/tesi_eprato01/checkpoints/ATLAS/vit-s/atlas_vits.ckpt
+    Inspected with torch.load: a Lightning checkpoint whose "state_dict"
+    has keys "network.encoder.backbone....", "network.q.weight",
+    "network.query_updater...", "network.temporal_q...", etc., which match
+    models/atlas.py.
+
+
+---------------------------------------------------------------------
+STEP 3 - PROBLEM: the backbone needs a gated HuggingFace model
+---------------------------------------------------------------------
+
+models/vit.py builds the backbone with
+    AutoModel.from_pretrained("facebook/dinov3-vits16-pretrain-lvd1689m")
+That repo is GATED (needs a HuggingFace token and accepted license) and
+compute nodes may not have internet. I had no HF token.
+
+Observation: the pretrained DINOv3 weights are useless at inference time,
+because the ATLAS checkpoint already contains ALL the backbone weights
+(finetuned). Only the ARCHITECTURE is needed.
+
+Solution (in infer_video.py):
+  1. dinov3_config_from_state_dict(): reads the shapes in the checkpoint and
+     builds a transformers.DINOv3ViTConfig:
+        hidden_size        = size of norm.weight            (384 for ViT-S)
+        num_hidden_layers  = number of "blocks.N" indices    (12)
+        num_attention_heads= hidden_size / 64               (6)
+        intermediate_size  = rows of mlp.up_proj.weight      (1536)
+        num_register_tokens= shape of register_tokens       (4)
+        patch_size         = kernel of patch_embeddings      (16)
+        use_gated_mlp      = presence of mlp.gate_proj keys (needed for big models)
+     This also works for vitb / vitl without changes.
+  2. _OfflineAutoModel: a tiny object with a from_pretrained() method that
+     returns DINOv3ViTModel(config) with random weights. It replaces
+     models.vit.AutoModel before ViT(...) is created ("monkey-patching"),
+     so the repo code stays untouched.
+  3. The checkpoint is loaded with load_state_dict and every key is checked:
+     apart from the RoPE "periods" buffer (recomputed from the config), any
+     missing or unexpected key raises an error. Result: 246 tensors loaded,
+     perfect match. So the rebuilt model is exactly the trained model.
+
+
+---------------------------------------------------------------------
+STEP 4 - preprocess_video.py (video -> frames)
+---------------------------------------------------------------------
+
+What it does:
+  - probe_video(): reads width, height, fps, duration with ffprobe.
+  - ffmpeg extracts frames as frame_000000.jpg, frame_000001.jpg, ...
+    (JPG like the ATLAS-120k images, high quality -q:v 2).
+  - options:
+      --fps N          subsample (0 = keep native 30 fps)
+      --crop auto      remove the black border: decode ~20 frames, take the
+                       pixel-wise maximum, keep rows/columns that are
+                       brighter than a threshold. For this video:
+                       x=199 y=0 w=1504 h=1080. Default is "none" because
+                       I don't know whether ATLAS training frames keep it.
+      --start/--duration  only part of the video (used for tests)
+      --max_side       optional downscale
+  - writes meta.json (fps, crop, original size, number of frames), which the
+    other scripts read.
+
+Problem met: json.dump crashed with "int64 is not JSON serializable" because
+the crop box came from numpy. Fix: cast to int().
+
+
+---------------------------------------------------------------------
+STEP 5 - infer_video.py (frames -> predictions)
+---------------------------------------------------------------------
+
+Pipeline:
+  1. build_model(): reads the YAML config, builds ViT + ATLAS (Step 3),
+     loads the checkpoint, moves to GPU, eval mode.
+  2. FrameDataset: opens each JPG and resizes it with PIL bilinear so the
+     short side is 256 (same function as the repo: scaled_size). Done in
+     DataLoader workers, so CPU decoding runs in parallel with the GPU.
+     1920x1080 -> 455x256.
+  3. to_crops(): cuts the 256x256 windows along the long side
+     (455 -> 2 windows with overlap), same formula as window_imgs_semantic.
+  4. predict(): runs the network on all windows (fp16 autocast), takes the
+     LAST block outputs, upsamples mask logits to 256x256, computes the
+     per-pixel class scores (sigmoid(mask) x softmax(class), dropping the
+     "no object" column), then merge_crops() averages overlapping windows.
+     It also returns the procedure logits and the query embeddings.
+  5. For each frame: scores are resized to the original resolution
+     (bilinear) and argmax gives the class map.
+
+Temporal mode (--clip_length > 1): frames are processed one by one; the
+query embeddings of frame t are given as prev_query_embed to frame t+1, and
+time_index = position inside the clip; everything is reset every
+clip_length frames, as in training.
+
+Outputs:
+  masks/frame_XXXXXX.png     class id per pixel (0..29)
+  overlay.mp4                video with coloured organs (background not coloured)
+  legend.png, classes.json   colour of each class
+  class_stats.csv            per frame: confidence + fraction of pixels per class
+  procedure.json             procedure probabilities averaged over frames
+  procedure_per_frame.csv    procedure probabilities of every frame
+  run_info.json              settings and speed
+
+Small CPU test on 5 frames: the model loaded and the overlay looked plausible.
+
+Problem: writing the overlay video failed (BrokenPipe). Cause: the cluster's
+ffmpeg module is compiled WITHOUT libx264 (the H.264 encoder). First fix:
+fall back to the "mpeg4" encoder. Later improved (Step 8) with imageio-ffmpeg.
+
+Problem: the first "confidence" was > 1. Reason: the per-pixel scores are a
+SUM over 100 queries, so they are not probabilities. Fix: normalise per
+pixel, confidence = max_c score[c] / sum_c score[c], which is in [0, 1].
+
+
+---------------------------------------------------------------------
+STEP 6 - About "appendectomy" on a laparoscopy video
+---------------------------------------------------------------------
+
+The procedure head is a CLOSED-SET classifier over the 14 ATLAS procedures
+(appendectomy, cholecystectomy, colectomy, ...). "Laparoscopy" is the
+surgical approach, not one of the classes, so the head must always pick one
+of the 14 even when the video is something else. On short or generic views
+(abdominal wall, peritoneum) its answer is unreliable. The segmentation of
+the 30 anatomy classes does not depend on the procedure prediction.
+
+
+---------------------------------------------------------------------
+STEP 7 - run_inference.sh (first version)
+---------------------------------------------------------------------
+
+SBATCH parameters copied from my runNNUnet.sh: partition all_usr_prod,
+account tesi_eprato01, 1 GPU (--gres=gpu:1), 8 CPUs, mail on END/FAIL.
+Changes: 32 GB of RAM and a 4 h time limit, absolute log paths in
+/homes/eprato01/logs/atlas_inference/ (that folder had to be created by hand,
+because SLURM does not create log directories), and no auto-resubmit trap
+(inference is short). The script runs preprocessing, skipping it if the
+frames are already there, then inference.
+
+
+---------------------------------------------------------------------
+STEP 8 - Switching to the ATLAS-model venv
+---------------------------------------------------------------------
+
+Request: use ~/ATLAS-model/.venv instead of myenv. It only had wandb.
+
+Done with uv:
+  uv pip install --python .venv/bin/python -r requirements.txt
+     --extra-index-url https://download.pytorch.org/whl/cu126
+  - all of requirements.txt EXCEPT:
+      wandb==0.19.10  -> the venv already had wandb 0.31, the old pin would
+                         have downgraded it
+      ipykernel       -> not needed
+  - plus imageio-ffmpeg: it ships its own static ffmpeg WITH libx264, so the
+    overlay video is real H.264 (plays in browsers and in W&B).
+  Verified: torch 2.7.0+cu126, transformers 4.56.1, wandb logged in through
+  ~/.netrc (entity 284215-universit-di-modena-unimore).
+
+
+---------------------------------------------------------------------
+STEP 9 - report.py (quantitative + qualitative results for my video)
+---------------------------------------------------------------------
+
+Without ground truth no accuracy can be computed, so the "quantitative"
+part is descriptive:
+  - class_summary.csv: per class, mean % of the frame, % of frames where it
+    is present (> 0.5% of pixels), max coverage, seconds present
+  - summary.json: mean confidence, classes per frame, procedure top-1, speed
+  - plots/: coverage over time (top 10, 1 s moving average), coverage and
+    presence bars, confidence over time, procedure probabilities
+
+Qualitative part, "representative frames":
+  - select_frames(): split the video into 12 equal segments and take the
+    most confident frame of each, so frames cover the whole video and are
+    not blurry or ambiguous ones.
+  - draw_representative(): original | overlay side by side; for each class
+    present, its name is written at the centre of its largest connected
+    region (scipy.ndimage.label + center_of_mass); legend with % of frame.
+  - saved in predictions_vits/representative_frames/
+
+W&B (project ATLAS-inference):
+  - per-frame curves with time in seconds as x axis (define_metric)
+  - tables, plots, the 12 frames as interactive masks (wandb.Image with
+    masks= lets you toggle each class), a 960 px H.264 preview of the video.
+
+Tested end to end on 15 frames with WANDB_MODE offline (so no test runs
+appeared in my account) before submitting.
+
+
+---------------------------------------------------------------------
+STEP 10 - Submitting the job and fixing a failure
+---------------------------------------------------------------------
+
+First submission (job 165760) failed after 1 second:
+    ERROR: Unable to locate a modulefile for 'cuda/12.6.0'
+The compute node does not have that module, and "set -euo pipefail" stops
+the script at the first error.
+Solution: the pip torch wheels contain their own CUDA runtime, so the cuda
+module is not needed at all -> removed. The ffmpeg module was made optional
+(module load ... || echo ...) and preprocess_video.py falls back to the
+imageio-ffmpeg binary (and reads video info through imageio_ffmpeg when
+ffprobe is missing). Tested with all modules unloaded.
+
+Second submission (job 165762) completed in 10 min on a Quadro RTX 6000:
+  - 5608 frames extracted in ~50 s, inference at 12 frames/s
+  - mean confidence 0.75, 15 classes seen, procedure top-1 appendectomy (0.69)
+
+
+---------------------------------------------------------------------
+STEP 11 - Quantitative evaluation on CholecSeg8k
+---------------------------------------------------------------------
+
+Idea: use a public dataset WITH ground truth to measure the model.
+
+Download: CholecSeg8k is on Kaggle; the public download endpoint works
+without credentials (checked first with a 1 KB range request: it returned
+a 3.1 GB zip starting with "PK"). Downloaded and unzipped into
+/work/tesi_eprato01/datasets/cholecseg8k: 17 videos, 8080 frames,
+854x480, each frame with *_endo_watershed_mask.png (one grey value per class).
+
+Problem: the two datasets have different classes (CholecSeg8k 13, ATLAS 30).
+Solution: a SHARED label space (EVAL_CLASSES in eval_cholecseg8k.py):
+
+  CholecSeg8k (mask value)        ATLAS class(es)
+  Black background (50)           Background
+  Abdominal wall (11)             Abdominal wall
+  Liver (21)                      Liver
+  Gastrointestinal tract (13)     Small intestine + Colon/rectum + Stomach
+  Fat (12)                        Fat
+  Grasper (31), L-hook (32)       Tools/camera
+  Cystic duct (25)                Bile/lymph duct
+  Gallbladder (22)                Gallbladder
+  Hepatic vein (33)               Vein
+  Liver ligament (5)              Hepatic ligament
+  Connective tissue (23), Blood (24), unlabelled (0, 255) -> IGNORED
+  Any other ATLAS class predicted -> "Other ATLAS class" (counts as error)
+
+Before trusting it, the mask values were checked on real files: exactly
+these values appeared, plus a few 0 / 255 pixels (unlabelled), which were
+then added to the ignored values.
+
+How the evaluation works:
+  - same model and same windowed inference as infer_video.py (functions
+    are imported from it, no duplication)
+  - two lookup tables: GT mask values -> shared ids, ATLAS ids -> shared ids
+  - a confusion matrix (ground truth x prediction) is accumulated on the
+    GPU with torch.bincount; ignored pixels are skipped
+  - from the confusion matrix: IoU = TP/(TP+FP+FN), Dice = 2TP/(2TP+FP+FN),
+    pixel accuracy, mIoU with and without background, per-video mIoU
+  - procedure accuracy: every CholecSeg8k video is a cholecystectomy, so
+    the procedure head can be scored per frame and per video
+  - W&B project ATLAS-CholecSeg8k (separate from my video), only numbers,
+    tables, bar chart and confusion matrix, no frames (as requested)
+
+Small problem in the test: Path.rglob does not follow symlinked folders, so
+a symlinked test clip was not found -> the clip was copied instead.
+Test on one clip: Liver IoU 0.95, Gallbladder 0.94.
+
+Job 165792 (3 min on an RTX A5000) results:
+  mIoU 0.528 (10 classes), 0.489 without background, pix

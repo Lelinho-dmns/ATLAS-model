@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment
+.venv/
+
+# Large data: videos, datasets, extracted frames
+materials/videos/
+*.mp4
+*.avi
+*.mov
+*.zip
+
+# Model weights
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# Experiment logs / outputs
+wandb/
+lightning_logs/
