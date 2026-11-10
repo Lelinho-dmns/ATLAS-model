@@ -18,7 +18,7 @@ Outputs (in --out_dir):
     class_stats.csv          per-frame mean confidence and fraction of pixels of each class
     procedure.json           procedure recognition (mean over frames + per-frame argmax)
     procedure_per_frame.csv  per-frame procedure probabilities
-    run_info.json            settings and timing
+    run_info.json            settings, timing and resource profiling (GPU/RAM/latency)
 """
 
 import argparse
@@ -44,6 +44,9 @@ sys.path.insert(0, str(REPO_ROOT))
 import models.vit  # noqa: E402
 from models.atlas import ATLAS  # noqa: E402
 from models.vit import ViT  # noqa: E402
+
+from profiler import (CudaTimer, ResourceMonitor, benchmark_latency, count_params,  # noqa: E402
+                      resolution_info, warmup)
 
 # Copied from datasets/atlas_semantic.py (importing it would pull in the whole data module)
 CLASS_NAMES = [
@@ -335,8 +338,12 @@ def main():
     stats.writerow(["frame", "time_s", "confidence"] + CLASS_NAMES)
     proc_probs = []
     prev_query_embed = None
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+
+    resized_hw = tuple(scaled_size((orig_h, orig_w), img_size))
+    num_windows = len(window_starts(max(resized_hw), min(img_size)))
+    warmup(predict, network, img_size, resized_hw, device, amp, 1 if temporal else args.batch_size)
+    monitor = ResourceMonitor(device).start()
+    model_timer = CudaTimer(device)
     t_start = time.time()
 
     for imgs, idxs in tqdm(loader, desc="Inference", unit="batch", mininterval=30):
@@ -349,7 +356,7 @@ def main():
         else:
             time_indices = torch.zeros(imgs.shape[0], device=device, dtype=torch.long)
 
-        with torch.autocast(device.type, dtype=torch.float16, enabled=amp):
+        with model_timer, torch.autocast(device.type, dtype=torch.float16, enabled=amp):
             scores, proc, query_embed = predict(network, imgs, img_size, time_indices, prev_query_embed)
         if temporal:
             prev_query_embed = query_embed
@@ -379,7 +386,24 @@ def main():
     stats_f.close()
     if writer is not None:
         writer.close()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     elapsed = time.time() - t_start
+    profile = monitor.stop()
+    model_s = model_timer.total_s()
+    n = len(frame_paths)
+    profile.update({
+        "num_params_M": count_params(network) / 1e6,
+        "batch_size": 1 if temporal else args.batch_size,
+        "model_time_per_frame_ms": model_s / n * 1000,
+        "model_fps": n / model_s,
+        "end_to_end_time_per_frame_ms": elapsed / n * 1000,
+        "end_to_end_fps": n / elapsed,
+        **resolution_info((orig_w, orig_h), resized_hw, img_size, num_windows),
+    })
+    if not temporal:
+        profile.update(benchmark_latency(predict, network, img_size, resized_hw, device, amp))
+    print("Profiling:\n" + "\n".join(f"  {k:32s} {v}" for k, v in profile.items()))
 
     with open(args.out_dir / "run_info.json", "w") as f:
         json.dump({
@@ -393,6 +417,7 @@ def main():
             "fps": fps,
             "elapsed_s": elapsed,
             "frames_per_s": len(frame_paths) / elapsed,
+            "profiling": profile,
         }, f, indent=2)
     print(f"{len(frame_paths)} frames in {elapsed:.1f}s ({len(frame_paths) / elapsed:.1f} frames/s, incl. I/O)")
 

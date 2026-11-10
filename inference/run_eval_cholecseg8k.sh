@@ -5,6 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
+#SBATCH --constraint=gpu_RTX_A5000_24G  # same GPU type for every backbone, so speed/memory are comparable
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
 #SBATCH --output=/homes/eprato01/logs/atlas_inference/atlas_cholecseg8k_%j.out
@@ -27,8 +28,9 @@ source /homes/eprato01/ATLAS-model/.venv/bin/activate
 REPO_DIR=/homes/eprato01/ATLAS-model
 DATA_ROOT=/work/tesi_eprato01/datasets/cholecseg8k
 
-MODEL_VARIANT=vits                                   # vits | vitb | vitl (must match CKPT)
-CKPT=/work/tesi_eprato01/checkpoints/ATLAS/vit-s/atlas_vits.ckpt
+# vits | vitb | vitl. Override at submission:  sbatch --export=ALL,MODEL_VARIANT=vitb <script>
+MODEL_VARIANT=${MODEL_VARIANT:-vits}
+CKPT=/work/tesi_eprato01/checkpoints/ATLAS/vit-${MODEL_VARIANT#vit}/atlas_${MODEL_VARIANT}.ckpt
 CONFIG=${REPO_DIR}/configs/ATLAS_DINOv3_${MODEL_VARIANT}.yaml
 
 CLIP_LENGTH=1    # 1 = per-frame (as the repo's validation); 5 = temporal query propagation (as training)
@@ -48,7 +50,7 @@ export WANDB_DIR=${OUT_DIR}
 # ============================================================
 cd "${REPO_DIR}"
 echo "Job ${SLURM_JOB_ID:-local} on $(hostname) - GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-echo "Checkpoint: ${CKPT}"
+echo "Model: ${MODEL_VARIANT}  Checkpoint: ${CKPT}"
 
 python inference/eval_cholecseg8k.py \
     --data_root "${DATA_ROOT}" \

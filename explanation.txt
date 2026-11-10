@@ -13,6 +13,9 @@ Files created (all in /homes/eprato01/ATLAS-model/inference/):
     run_inference.sh          SLURM job: preprocess + inference + report
     eval_cholecseg8k.py       quantitative evaluation on CholecSeg8k + W&B
     run_eval_cholecseg8k.sh   SLURM job for the evaluation
+    profiler.py               GPU memory / RAM / GPU utilisation / timing (step 12)
+    submit_all_backbones.sh   submits both experiments for vits, vitb, vitl (step 13)
+    collect_results.py        writes results_ex_2.txt (step 13)
 
 Results:
     /work/tesi_eprato01/ATLAS_inference/aries_crop_2025-08-25_073541_VID001/
@@ -345,4 +348,107 @@ a symlinked test clip was not found -> the clip was copied instead.
 Test on one clip: Liver IoU 0.95, Gallbladder 0.94.
 
 Job 165792 (3 min on an RTX A5000) results:
-  mIoU 0.528 (10 classes), 0.489 without background, pix
+  mIoU 0.528 (10 classes), 0.489 without background, pixel accuracy 0.898,
+  mDice 0.596, procedure accuracy 73.0% of frames and 15/17 videos (88.2%)
+  recognised as cholecystectomy, 61 frames/s end to end.
+
+
+---------------------------------------------------------------------
+STEP 12 - Measuring efficiency (inference/profiler.py)
+---------------------------------------------------------------------
+
+Request: peak GPU memory, peak RAM, GPU utilisation, inference time per
+frame, FPS and resolution for every experiment.
+
+Problem with the old numbers: the only speed figure was the end-to-end
+frames/s. For the video that includes writing 5608 PNGs and encoding the
+overlay video, so 12 fps said little about the model itself. The two ViT-S
+runs had also used different GPUs (Quadro RTX 6000 and RTX A5000).
+
+profiler.py (used by infer_video.py and eval_cholecseg8k.py):
+  - ResourceMonitor: a background thread that every 0.2 s reads
+      * GPU utilisation and used device memory through NVML (nvidia-ml-py);
+        the GPU is found by its UUID, so it is the right one even when
+        SLURM sets CUDA_VISIBLE_DEVICES
+      * RAM: RSS of the main process and PSS of the main process + DataLoader
+        workers (psutil). PSS is used for the sum because forked workers share
+        pages with the parent: summing RSS would count them several times.
+    At the end it also reads torch.cuda.max_memory_allocated / reserved and
+    ru_maxrss (lifetime peak of the main process, includes loading the .ckpt).
+  - CudaTimer: CUDA events around predict(), so the GPU time of the model is
+    measured without adding a synchronize at every batch.
+  - warmup(): 3 forward passes before timing (cuDNN/cuBLAS setup).
+  - benchmark_latency(): after the run, 200 timed calls on ONE frame at batch
+    size 1 (20 warm-up calls), synchronised: the real-time number.
+  - resolution_info(): input resolution, resized resolution (455x256),
+    window size (256x256) and windows per frame (2).
+  All numbers go into run_info.json["profiling"] (video) and
+  summary.json["profiling"] (CholecSeg8k), and into the W&B run summaries
+  as profiling/<name>.
+
+Tested on CPU (4 video frames) and on a free P100 of the login node (ViT-L,
+6 CholecSeg8k frames, W&B offline) before submitting.
+
+
+---------------------------------------------------------------------
+STEP 13 - ViT-B and ViT-L
+---------------------------------------------------------------------
+
+Download: the finetuned ATLAS weights linked in the README are public on
+HuggingFace (no token needed):
+    /work/tesi_eprato01/checkpoints/ATLAS/vit-b/atlas_vitb.ckpt   1.1 GB
+    /work/tesi_eprato01/checkpoints/ATLAS/vit-l/atlas_vitl.ckpt   3.8 GB
+(the files are larger than the models because they also contain the
+optimizer state). No code change was needed for the architecture:
+dinov3_config_from_state_dict() rebuilt both backbones from the shapes
+(ViT-B 768 dim / 12 blocks, 94.3M parameters, 246 tensors; ViT-L 1024 dim /
+24 blocks, 318.3M parameters, 450 tensors), with an exact key match.
+
+SLURM scripts:
+  - MODEL_VARIANT can be set at submission
+      sbatch --export=ALL,MODEL_VARIANT=vitb inference/run_eval_cholecseg8k.sh
+    and the checkpoint path is derived from it.
+  - --constraint=gpu_RTX_A5000_24G: every backbone runs on the same GPU type,
+    otherwise speed and memory could not be compared.
+    Problem met: the first choice was the L40S (45 GB), but the cluster only
+    allows >24 GB GPUs on the boost_usr_prod partition, which is reserved for
+    jobs that really need more than 24 GB. ATLAS does not (even ViT-L needs a
+    few GB), so the 24 GB RTX A5000 on all_usr_prod was used instead.
+  - submit_all_backbones.sh submits the 2 experiments x 3 backbones.
+    ViT-S was run again too, with the profiling, on the same GPU type.
+    The small result files of the first ViT-S runs were saved before in
+    /work/tesi_eprato01/ATLAS_inference/_backup_vits_2026-10-23/.
+
+collect_results.py reads all outputs and writes results_ex_2.txt in the repo
+root (tables per backbone, the class matching and the definitions of every
+measure). Runs not finished yet appear as "pending".
+
+
+---------------------------------------------------------------------
+STEP 14 - Results of the three backbones (jobs 195648-195653)
+---------------------------------------------------------------------
+
+All 6 jobs completed on node huber (RTX A5000), one at a time, between
+9 Nov 14:24 and 10 Nov 06:25. Full tables in results_ex_2.txt.
+
+CholecSeg8k:        ViT-S    ViT-B    ViT-L
+  mIoU              0.528    0.587    0.612
+  mIoU no bg        0.489    0.554    0.582
+  pixel accuracy    0.898    0.918    0.926
+  model ms/frame    4.0      7.7      15.1     (batch 16, GPU time)
+  batch-1 latency   21.5     21.4     35.5 ms
+  peak GPU memory   4.1      5.1      6.5 GB   (nvidia-smi)
+
+ViT-S accuracy is the same as in October, so the rerun is consistent.
+
+Problem met: the end-to-end FPS went UP with model size (video 4.6, 6.2,
+9.5 FPS). Checked with sacct: the jobs did not overlap, they just ran at
+different hours on a node shared with other users' CPU jobs, and the GPU
+was idle most of the time (utilisation 3-18 % on the video). So end-to-end
+speed measures the CPU load of the node, not the model. Conclusion: the
+backbones are compared with model time and batch-1 latency; a caution was
+added to results_ex_2.txt.
+
+Also noticed: batch-1 latency is the same for ViT-S and ViT-B (~21 ms),
+because one frame is too little work to fill the GPU and fixed per-call
+overhead dominates. Only ViT-L is limited by computation.

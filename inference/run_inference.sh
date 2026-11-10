@@ -5,6 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
+#SBATCH --constraint=gpu_RTX_A5000_24G  # same GPU type for every backbone, so speed/memory are comparable
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
 #SBATCH --output=/homes/eprato01/logs/atlas_inference/atlas_inference_%j.out
@@ -29,8 +30,9 @@ source /homes/eprato01/ATLAS-model/.venv/bin/activate
 REPO_DIR=/homes/eprato01/ATLAS-model
 VIDEO=${REPO_DIR}/materials/videos/aries_crop_2025-08-25_073541_VID001.mp4
 
-MODEL_VARIANT=vits                                   # vits | vitb | vitl (must match CKPT)
-CKPT=/work/tesi_eprato01/checkpoints/ATLAS/vit-s/atlas_vits.ckpt
+# vits | vitb | vitl. Override at submission:  sbatch --export=ALL,MODEL_VARIANT=vitb <script>
+MODEL_VARIANT=${MODEL_VARIANT:-vits}
+CKPT=/work/tesi_eprato01/checkpoints/ATLAS/vit-${MODEL_VARIANT#vit}/atlas_${MODEL_VARIANT}.ckpt
 CONFIG=${REPO_DIR}/configs/ATLAS_DINOv3_${MODEL_VARIANT}.yaml
 
 VIDEO_NAME=$(basename "${VIDEO%.*}")
@@ -59,7 +61,7 @@ export WANDB_DIR=${PRED_DIR}
 cd "${REPO_DIR}"
 echo "Job ${SLURM_JOB_ID:-local} on $(hostname) - GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "Video: ${VIDEO}"
-echo "Checkpoint: ${CKPT}"
+echo "Model: ${MODEL_VARIANT}  Checkpoint: ${CKPT}"
 
 if [ -f "${FRAMES_DIR}/meta.json" ]; then
     echo "Frames already extracted in ${FRAMES_DIR}, skipping preprocessing (delete the folder to redo it)."

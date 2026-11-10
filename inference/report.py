@@ -203,6 +203,8 @@ def main():
         "num_classes_seen": int(present[:, 1:].any(0).sum()),
         "inference_frames_per_s": run_info["frames_per_s"],
     }
+    if "profiling" in run_info:
+        summary["profiling"] = run_info["profiling"]
     if proc is not None:
         top_name, top_p = next(iter(proc["mean_probabilities"].items()))
         summary["procedure_top1"] = top_name
@@ -278,7 +280,8 @@ def main():
     if proc is not None:
         run.log({"procedure_probabilities": wandb.Table(
             columns=["procedure", "mean_probability"], data=list(proc["mean_probabilities"].items()))})
-    run.summary.update(summary)
+    run.summary.update({k: v for k, v in summary.items() if k != "profiling"})
+    run.summary.update({f"profiling/{k}": v for k, v in summary.get("profiling", {}).items()})
     run.finish()
 
 

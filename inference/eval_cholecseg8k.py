@@ -33,7 +33,10 @@ from PIL import Image  # noqa: E402
 from torch.utils.data import DataLoader, Dataset  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
-from infer_video import CLASS_NAMES, PROCEDURE_NAMES, REPO_ROOT, build_model, predict, scaled_size  # noqa: E402
+from infer_video import (CLASS_NAMES, PROCEDURE_NAMES, REPO_ROOT, build_model, predict,  # noqa: E402
+                         scaled_size, window_starts)
+from profiler import (CudaTimer, ResourceMonitor, benchmark_latency, count_params,  # noqa: E402
+                      resolution_info, warmup)
 
 # Shared label space: (name, CholecSeg8k watershed-mask values, ATLAS class ids)
 EVAL_CLASSES = [
@@ -182,6 +185,13 @@ def main():
     chole = PROCEDURE_NAMES.index("cholecystectomy")
     prev_query_embed, prev_clip, t_in_clip = None, None, 0
 
+    first = Image.open(dataset.items[0][0])
+    orig_w, orig_h = first.size
+    resized_hw = tuple(scaled_size((orig_h, orig_w), img_size))
+    num_windows = len(window_starts(max(resized_hw), min(img_size)))
+    warmup(predict, network, img_size, resized_hw, device, amp, 1 if temporal else args.batch_size)
+    monitor = ResourceMonitor(device).start()
+    model_timer = CudaTimer(device)
     t_start = time.time()
     for imgs, gts, idxs in tqdm(loader, desc="CholecSeg8k", mininterval=30):
         imgs, gts = imgs.to(device, non_blocking=True), gts.to(device, non_blocking=True)
@@ -195,7 +205,7 @@ def main():
         else:
             time_indices = torch.zeros(imgs.shape[0], device=device, dtype=torch.long)
 
-        with torch.no_grad(), torch.autocast(device.type, dtype=torch.float16, enabled=amp):
+        with model_timer, torch.no_grad(), torch.autocast(device.type, dtype=torch.float16, enabled=amp):
             scores, proc, query_embed = predict(network, imgs, img_size, time_indices, prev_query_embed)
         if temporal:
             prev_query_embed = query_embed
@@ -212,7 +222,26 @@ def main():
                 p = proc[b].softmax(-1)
                 proc_probs[video].append(p.cpu())
                 proc_correct[video].append(int(p.argmax()) == chole)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     elapsed = time.time() - t_start
+    profile = monitor.stop()
+    model_s = model_timer.total_s()
+    n = len(dataset)
+    profile.update({
+        "device": torch.cuda.get_device_name() if device.type == "cuda" else "cpu",
+        "num_params_M": count_params(network) / 1e6,
+        "batch_size": 1 if temporal else args.batch_size,
+        "amp_fp16": amp,
+        "model_time_per_frame_ms": model_s / n * 1000,
+        "model_fps": n / model_s,
+        "end_to_end_time_per_frame_ms": elapsed / n * 1000,
+        "end_to_end_fps": n / elapsed,
+        **resolution_info((orig_w, orig_h), resized_hw, img_size, num_windows),
+    })
+    if not temporal:
+        profile.update(benchmark_latency(predict, network, img_size, resized_hw, device, amp))
+    print("Profiling:\n" + "\n".join(f"  {k:32s} {v}" for k, v in profile.items()))
 
     # ---------------- metrics ----------------
     conf = conf_total.cpu().numpy()
@@ -246,6 +275,7 @@ def main():
         "num_frames": len(dataset),
         "num_videos": len(videos),
         "frames_per_s": len(dataset) / elapsed,
+        "profiling": profile,
     }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +324,8 @@ def main():
             columns=["ground_truth"] + EVAL_NAMES + ["Other ATLAS class"],
             data=[[EVAL_NAMES[i]] + conf[i].tolist() for i in range(n_gt)]),
     })
-    run.summary.update(summary)
+    run.summary.update({k: v for k, v in summary.items() if k != "profiling"})
+    run.summary.update({f"profiling/{k}": v for k, v in profile.items()})
     run.summary.update({f"iou/{r['class']}": r["iou"] for r in per_class})
     run.finish()
 
